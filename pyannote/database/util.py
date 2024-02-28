@@ -145,7 +145,7 @@ def get_label_identifier(label, current_file):
     return database + "|" + label
 
 
-def load_rttm(file_rttm, keep_type="SPEAKER"):
+def load_rttm(file_rttm, keep_type="SPEAKER", keep_confidence=False):
     """Load RTTM file
 
     Parameter
@@ -171,10 +171,12 @@ def load_rttm(file_rttm, keep_type="SPEAKER"):
         "NA3",
         "NA4",
         "speaker",
-        "NA5",
+        "confidence" if keep_confidence else "NA5",
         "NA6",
     ]
     dtype = {"uri": str, "start": float, "duration": float, "speaker": str}
+    if keep_confidence:
+        dtype["confidence"] = float
     data = pd.read_csv(
         file_rttm,
         names=names,
@@ -190,9 +192,52 @@ def load_rttm(file_rttm, keep_type="SPEAKER"):
             if turn.type != keep_type:
                 continue
             segment = Segment(turn.start, turn.start + turn.duration)
-            annotation[segment, i] = turn.speaker
+            #TODO For now we suppose there is only one segment by annotation
+            if keep_confidence:
+                annotation[segment, i] = (turn.speaker, turn.confidence)
+            else:
+                annotation[segment, i] = turn.speaker
         annotations[uri] = annotation
+    return annotations
 
+def load_vada(file_vada):
+    """Load VADA file (Valence, Arousal and Dominance Annotations)
+
+    Parameter
+    ---------
+    file_vada: str
+        Path to VADA file
+
+    Returns
+    -------
+    annotations: `dict`
+        VAD as a {uri: [(pyannote.core.Segment, [A, V, D]), ...]} dictionnary.
+    """
+
+    names = [
+        "uri",
+        "NA1",
+        "start",
+        "duration",
+        "arousal",
+        "valence",
+        "dominance",
+    ]
+    dtype = {"uri": str, "start": float, "duration": float, "arousal": float, "valence": float, "dominance": float}
+    data = pd.read_csv(
+        file_vada,
+        names=names,
+        dtype=dtype,
+        delim_whitespace=True,
+    )
+
+    annotations = {}
+    for uri, turns in data.groupby("uri"):
+        annotation = Annotation(uri=uri)
+        for i, turn in turns.iterrows():
+            segment = Segment(turn.start, turn.start + turn.duration)
+            annotation[segment, i] = (turn.arousal, turn.valence, turn.dominance)
+        annotations[uri] = annotation
     return annotations
 
 

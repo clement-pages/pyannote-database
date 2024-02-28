@@ -49,10 +49,11 @@ setup(
             ".map = pyannote.database.loader:MAPLoader",
             ".lab = pyannote.database.loader:LABLoader",
             ".stm = pyannote.database.loader:STMLoader",
+            ".vada = pyannote.database.loader:VADALoader",
         ],
     },
     # versioneer
-    version=versioneer.get_version(),
+    version="5.0.1",
     cmdclass=versioneer.get_cmdclass(),
     # PyPI
     name="pyannote.database",

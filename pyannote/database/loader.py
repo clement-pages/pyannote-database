@@ -32,12 +32,13 @@
 from typing import Text
 from pathlib import Path
 import string
-from pyannote.database.util import load_rttm, load_uem, load_lab, load_stm
+from pyannote.database.util import load_rttm, load_uem, load_lab, load_stm, load_vada
 import pandas as pd
 from pyannote.core import Segment, Timeline, Annotation
 from pyannote.database.protocol.protocol import ProtocolFile
 from typing import Union, Any
 import warnings
+from typing import Tuple
 
 
 try:
@@ -116,7 +117,7 @@ class RTTMLoader:
 
         _, placeholders, _, _ = zip(*string.Formatter().parse(self.path))
         self.placeholders_ = set(placeholders) - set([None])
-        self.loaded_ = dict() if self.placeholders_ else load_rttm(self.path)
+        self.loaded_ = dict() if self.placeholders_ else load_rttm(self.path, keep_confidence=False)
 
     def __call__(self, file: ProtocolFile) -> Annotation:
 
@@ -141,6 +142,48 @@ class RTTMLoader:
 
         return self.loaded_[uri]
 
+class ExtendedRTTMLoader:
+    """ Extended RTTM loader. Same as RTTMLoader, with a support
+    for the confidence field.
+
+    Can be used as a preprocessor.
+
+    Parameters
+    ----------
+    path : str
+        Path to RTTM file with optional ProtocolFile key placeholders
+        (e.g. "/path/to/{database}/{subset}/{uri}.rttm")
+    """
+
+    def __init__(self, path: Text = None):
+        super().__init__()
+
+        self.path = str(path)
+        _, placeholders, _, _ = zip(*string.Formatter().parse(self.path))
+        self.placeholders_ = set(placeholders) - set([None])
+        self.loaded_ = dict() if self.placeholders_ else load_rttm(self.path, keep_confidence=True)
+
+    def __call__(self, file: ProtocolFile) -> Tuple:
+
+        uri = file["uri"]
+        if uri in self.loaded_:
+            return self.loaded_[uri]
+
+        sub_file = {key: file[key] for key in self.placeholders_}
+        loaded = load_rttm(self.path.format(**sub_file))
+        if uri not in loaded:
+            loaded[uri] = Annotation(uri=uri)
+
+        # do not cache annotations when there is one RTTM file per "uri"
+        # since loading it should be quite fast
+        if "uri" in self.placeholders_:
+            return loaded[uri]
+
+        # when there is more than one file in loaded RTTM, cache them all
+        # so that loading future "uri" will be instantaneous
+        self.loaded_.update(loaded)
+
+        return self.loaded_[uri]
 
 class STMLoader:
     """STM loader
@@ -377,3 +420,48 @@ class MAPLoader:
             raise KeyError(msg)
 
         return value
+
+
+class VADALoader:
+    """VADA loader
+
+    Can be used as preprocessor.
+
+    Parameters
+    ----------
+    path : str
+        Path to VADA file with optional ProtocolFile key placeholders
+        (e.g. "/path/to/{database}/{subset}/{uri}.vada")
+    """
+
+    def __init__(self, path: Text = None):
+        super().__init__()
+
+        self.path = str(path)
+
+        _, placeholders, _, _ = zip(*string.Formatter().parse(self.path))
+        self.placeholders_ = set(placeholders) - set([None])
+        self.loaded_ = dict() if self.placeholders_ else load_vada(self.path)
+
+    def __call__(self, file: ProtocolFile) -> Annotation:
+
+        uri = file["uri"]
+
+        if uri in self.loaded_:
+            return self.loaded_[uri]
+
+        sub_file = {key: file[key] for key in self.placeholders_}
+        loaded = load_vada(self.path.format(**sub_file))
+        if uri not in loaded:
+            loaded[uri] = Annotation(uri=uri)
+
+        # do not cache annotations when there is one VADA file per "uri"
+        # since loading it should be quite fast
+        if "uri" in self.placeholders_:
+            return loaded[uri]
+
+        # when there is more than one file in loaded VADA, cache them all
+        # so that loading future "uri" will be instantaneous
+        self.loaded_.update(loaded)
+
+        return self.loaded_[uri]
