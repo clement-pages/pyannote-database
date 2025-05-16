@@ -27,16 +27,20 @@
 # Hervé BREDIN - http://herve.niderb.fr
 # Alexis PLAQUET
 
-
-import typer
-from enum import Enum
 import math
-from typing import Text
-from pyannote.database import Database
-from pyannote.database import registry
-from pyannote.database.protocol import CollectionProtocol
-from pyannote.database.protocol import SpeakerDiarizationProtocol
+import os
+from enum import Enum
+from pathlib import Path
+from typing import Optional, Text
+
+import boto3
+import typer
+import yaml
 from pyannote.core import Annotation
+from typing_extensions import Annotated
+
+from pyannote.database import Database, FileFinder, registry
+from pyannote.database.protocol import CollectionProtocol, SpeakerDiarizationProtocol
 
 app = typer.Typer()
 
@@ -90,7 +94,11 @@ def protocol(
         case_sensitive=False,
     ),
     task: Task = typer.Option(
-        "Any", "--task", "-t", help="Filter protocols by TASK.", case_sensitive=False,
+        "Any",
+        "--task",
+        "-t",
+        help="Filter protocols by TASK.",
+        case_sensitive=False,
     ),
 ):
     """Print list of protocols"""
@@ -175,6 +183,187 @@ def info(protocol: str):
                     f"   {duration_to_str(speech)} of speech ({100 * speech / duration:.0f}%)"
                 )
                 typer.echo(f"   {len(speakers)} speakers")
+
+
+@app.command("upload", help="Upload protocol(s) to AWS S3")
+def upload(
+    dataset: Annotated[
+        Path,
+        typer.Argument(help="Path to dataset to upload"),
+    ],
+    s3_path: Annotated[
+        str,
+        typer.Argument(help="S3 path to upload the protocol on, at bucket/path/to/dataset format."),
+    ],
+    targets: Annotated[
+        list[str],
+        typer.Option(
+            "--protocol",
+            "-p",
+            case_sensitive=False,
+            metavar="TARGETS",
+            help="Target protocols to upload on S3, at database.task.protocol.subset format",
+        ),
+    ] = ["*"],
+    database: Annotated[
+        str,
+        typer.Option(
+            "--database",
+            "-d",
+            metavar="DATABASE",
+            help="Path to database.yml. By default, the command will try to find a database.yml file into dataset_root",
+        ),
+    ] = "",
+):
+    """Upload dataset to AWS S3."""
+    dataset = dataset.resolve()
+
+    s3_database = {
+        "Databases": {},
+        "Protocols": {},
+    }
+
+    s3 = boto3.client("s3")
+
+    splitted_s3_path = s3_path.split("/")
+    bucket = splitted_s3_path[0]
+    try:
+        s3_dataset = "/".join(splitted_s3_path[1:])
+    except IndexError:
+        s3_dataset = dataset.name
+
+    # if not database was specified, try to find one in dataset repo
+    if not database:
+        typer.echo(f"No database.yml file specified. Looking for one in {dataset}")
+        for dirpath, _, filenames in os.walk(dataset):
+            for filename in filenames:
+                if filename == "database.yml":
+                    database = f"{dirpath}/{filename}"
+                    typer.echo(f"Database file found at {database}.")
+                    break
+
+    if not database:
+        raise FileNotFoundError("No database.yml found")
+    database_path = Path(database).resolve()
+
+    registry.load_database(database_path)
+    with open(database_path, "r") as stream:
+        input_db = yaml.safe_load(stream)
+
+    for target in targets:
+        typer.echo(f"Processing {target}...")
+        target = target.split(".")
+
+        sdatabase = target[0]
+        stask = target[1] if len(target) > 1 else "*"
+        sprotocol = target[2] if len(target) > 2 else "*"
+        ssubset = target[3] if len(target) > 3 else "*"
+
+        databases = (
+            list(registry.databases) if sdatabase == "*" else sdatabase.split("|")
+        )
+        for database_name in databases:
+            db = registry.get_database(database_name)
+            s3_database["Databases"][database_name] = input_db["Databases"][
+                database_name
+            ]
+            s3_database["Protocols"][database_name] = {}
+
+            tasks = db.get_tasks() if stask == "*" else stask.split("|")
+            for task_name in tasks:
+                try:
+                    protocols = db.get_protocols(task_name)
+                except KeyError:
+                    continue
+
+                s3_database["Protocols"][database_name][task_name] = {}
+
+                if sprotocol != "*":
+                    protocols = [p for p in protocols if p in sprotocol.split("|")]
+
+                for protocol_name in protocols:
+                    typer.echo(
+                        f"Processing {database_name}.{task_name}.{protocol_name}..."
+                    )
+
+                    # load current protocol
+                    protocol = registry.get_protocol(
+                        f"{database_name}.{task_name}.{protocol_name}",
+                        preprocessors={"audio": FileFinder()},
+                    )
+
+                    input_db_protocol: dict = input_db["Protocols"][database_name][
+                        task_name
+                    ][protocol_name]
+
+                    protocol_metadata = {}
+                    protocol_metadata["scope"] = input_db_protocol.pop("scope", "file")
+
+                    subsets = (
+                        list(input_db_protocol.keys())
+                        if ssubset == "*"
+                        else ssubset.split("|")
+                    )
+
+                    for subset in subsets:
+                        typer.echo(f"Processing {subset}...")
+
+                        protocol_metadata[subset] = {}
+
+                        paths_to_upload: list[str] = []
+                        for key, path in input_db_protocol[subset].items():
+                            protocol_metadata[subset][key] = path
+
+                            # if path contains uri placeholder
+                            if "{uri}" in path:
+                                paths_to_upload.append(path)
+                                continue
+
+                            path = Path(path)
+
+                            if path.is_absolute():
+                                abspath = path
+                            else:
+                                abspath = database_path.parent / path
+
+                            relpath = os.path.relpath(abspath, dataset)
+                            s3.upload_file(
+                                str(abspath), bucket, f"{s3_dataset}/{relpath}"
+                            )
+
+                        for protocol_file in getattr(protocol, subset)():
+                            audio = protocol_file["audio"]
+                            relaudio = os.path.relpath(audio, dataset)
+                            uri = protocol_file["uri"]
+
+                            s3.upload_file(audio, bucket, f"{s3_dataset}/{relaudio}")
+                            for path in paths_to_upload:
+                                path = Path(path.format(uri=uri))
+
+                                if path.is_absolute():
+                                    abspath = path
+                                else:
+                                    abspath = database_path.parent / path
+
+                                relpath = os.path.relpath(abspath, dataset)
+                                s3.upload_file(
+                                    str(abspath), bucket, f"{s3_dataset}/{relpath}"
+                                )
+
+                    s3_database["Protocols"][database_name][task_name][
+                        protocol_name
+                    ] = protocol_metadata
+
+    s3_database_path = Path("s3_database.yml")
+    with open(s3_database_path, "w") as stream:
+        yaml.safe_dump(s3_database, stream)
+
+    s3.upload_file(
+        str(s3_database_path),
+        bucket,
+        f"{s3_dataset}/{os.path.relpath(database_path, dataset)}",
+    )
+    s3_database_path.unlink()
 
 
 def main():
